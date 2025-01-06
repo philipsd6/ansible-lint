@@ -1,2 +1,4 @@
-- name: shell instead of command
-  shell: echo hello world
+---
+- name: Shell instead of command
+  ansible.builtin.shell:
+    cmd: echo hello world

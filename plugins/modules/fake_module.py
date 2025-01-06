@@ -2,15 +2,24 @@
 
 This is used to test ability to detect and use custom modules.
 """
+
 from ansible.module_utils.basic import AnsibleModule
 
+EXAMPLES = r"""
+- name: "playbook"
+  tasks:
+    - name: Hello
+      debug:
+        msg: 'world'
+"""
 
-def main():
+
+def main() -> None:
     """Return the module instance."""
-    return AnsibleModule(
-        argument_spec=dict(
-            data=dict(default=None),
-            path=dict(default=None, type=str),
-            file=dict(default=None, type=str),
-        )
+    AnsibleModule(
+        argument_spec={
+            "data": {"default": None},
+            "path": {"default": None},
+            "file": {"default": None},
+        },
     )

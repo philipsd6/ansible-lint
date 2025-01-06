@@ -1,2 +1,3 @@
 ---
-- include_tasks: tasks/simpletask.yml
+- name: simple_task | One include
+  include_tasks: tasks/simple_task.yml

@@ -1,6 +1,6 @@
 ---
-- name: test
-  gather_facts: no
+- name: Fixture for test_run_playbook test
+  gather_facts: false
   hosts: all
   roles:
     - role: test-role

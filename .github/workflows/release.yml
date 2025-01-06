@@ -1,48 +1,57 @@
+---
 name: release
 
-on:
+"on":
   release:
     types: [published]
+  workflow_dispatch:
 
 jobs:
+  # https://github.com/marketplace/actions/actions-tagger
+  actions-tagger:
+    needs: pypi # do not move the mobile tag until we publish
+    runs-on: windows-latest
+    permissions:
+      # Give the default GITHUB_TOKEN write permission.
+      # https://github.blog/changelog/2023-02-02-github-actions-updating-the-default-github_token-permissions-to-read-only/
+      contents: write
+    steps:
+      - uses: Actions-R-Us/actions-tagger@latest
+        with:
+          token: "${{ github.token }}"
+          # Do not activate latest tag because it seems to affect RTD builds
+          # publish_latest_tag: true
   pypi:
     name: Publish to PyPI registry
     environment: release
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
 
     env:
       FORCE_COLOR: 1
       PY_COLORS: 1
-      TOXENV: packaging
-      TOX_PARALLEL_NO_SPINNER: 1
+      TOXENV: pkg
 
     steps:
-    - name: Switch to using Python 3.8 by default
-      uses: actions/setup-python@v2
-      with:
-        python-version: 3.8
-    - name: Install tox
-      run: >-
-        python3 -m
-        pip install
-        --user
-        tox
-    - name: Check out src from Git
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0  # needed by setuptools-scm
-    - name: Build dists
-      run: python -m tox
-    - name: Publish to test.pypi.org
-      if: >-  # "create" workflows run separately from "push" & "pull_request"
-        github.event_name == 'release'
-      uses: pypa/gh-action-pypi-publish@master
-      with:
-        password: ${{ secrets.testpypi_password }}
-        repository_url: https://test.pypi.org/legacy/
-    - name: Publish to pypi.org
-      if: >-  # "create" workflows run separately from "push" & "pull_request"
-        github.event_name == 'release'
-      uses: pypa/gh-action-pypi-publish@master
-      with:
-        password: ${{ secrets.pypi_password }}
+      - name: Switch to using Python 3.10 by default
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install tox
+        run: python3 -m pip install --user "tox>=4.0.0"
+
+      - name: Check out src from Git
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # needed by setuptools-scm
+          submodules: true
+
+      - name: Build dists
+        run: python3 -m tox
+
+      - name: Publish to pypi.org
+        if: >- # "create" workflows run separately from "push" & "pull_request"
+          github.event_name == 'release'
+        uses: pypa/gh-action-pypi-publish@release/v1
