@@ -1,4 +1,4 @@
-# (c) 2019–2020, Ansible by Red Hat
+# (c) 2019-2020, Ansible by Red Hat
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -19,23 +19,44 @@
 # THE SOFTWARE.
 
 """Utils related to inline skipping of rules."""
+
+from __future__ import annotations
+
+import collections.abc
 import logging
-from functools import lru_cache
+import re
+import warnings
+from collections.abc import MutableMapping, Sequence
+from functools import cache
 from itertools import product
-from typing import TYPE_CHECKING, Any, Generator, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any
 
 # Module 'ruamel.yaml' does not explicitly export attribute 'YAML'; implicit reexport disabled
-from ruamel.yaml import YAML  # type: ignore
+from ruamel.yaml import YAML
+from ruamel.yaml.composer import ComposerError
+from ruamel.yaml.scanner import ScannerError
+from ruamel.yaml.tokens import CommentToken
 
 from ansiblelint.config import used_old_tags
-from ansiblelint.constants import RENAMED_TAGS
-from ansiblelint.file_utils import Lintable
+from ansiblelint.constants import (
+    NESTED_TASK_KEYS,
+    PLAYBOOK_TASK_KEYWORDS,
+    RENAMED_TAGS,
+    SKIPPED_RULES_KEY,
+)
+from ansiblelint.errors import LintWarning, WarnSource
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
+
     from ansible.parsing.yaml.objects import AnsibleBaseYAMLObject
 
-_logger = logging.getLogger(__name__)
+    from ansiblelint.file_utils import Lintable
 
+
+_logger = logging.getLogger(__name__)
+_found_deprecated_tags: set[str] = set()
+_noqa_comment_re = re.compile(r"^# noqa(\s|:)")
 
 # playbook: Sequence currently expects only instances of one of the two
 # classes below but we should consider avoiding this chimera.
@@ -43,16 +64,41 @@ _logger = logging.getLogger(__name__)
 # ansible.parsing.yaml.objects.AnsibleSequence
 
 
-def get_rule_skips_from_line(line: str) -> List[str]:
+def get_rule_skips_from_line(
+    line: str,
+    lintable: Lintable,
+    lineno: int = 1,
+) -> list[str]:
     """Return list of rule ids skipped via comment on the line of yaml."""
     _before_noqa, _noqa_marker, noqa_text = line.partition("# noqa")
-    noqa_text = noqa_text.lstrip(" :")
-    return noqa_text.split()
+
+    result = []
+    for v in noqa_text.lstrip(" :").split():
+        if v in RENAMED_TAGS:
+            tag = RENAMED_TAGS[v]
+            if v not in _found_deprecated_tags:
+                msg = f"Replaced outdated tag '{v}' with '{tag}', replace it to avoid future errors"
+                warnings.warn(
+                    message=msg,
+                    category=LintWarning,
+                    source=WarnSource(
+                        filename=lintable,
+                        lineno=lineno,
+                        tag="warning[outdated-tag]",
+                        message=msg,
+                    ),
+                    stacklevel=0,
+                )
+                _found_deprecated_tags.add(v)
+            v = tag
+        result.append(v)
+    return result
 
 
-def append_skipped_rules(
-    pyyaml_data: "AnsibleBaseYAMLObject", lintable: Lintable
-) -> "AnsibleBaseYAMLObject":
+def append_skipped_rules(  # type: ignore[no-any-unimported]
+    pyyaml_data: AnsibleBaseYAMLObject,
+    lintable: Lintable,
+) -> AnsibleBaseYAMLObject:
     """Append 'skipped_rules' to individual tasks or single metadata block.
 
     For a file, uses 2nd parser (ruamel.yaml) to pull comments out of
@@ -69,7 +115,7 @@ def append_skipped_rules(
         yaml_skip = _append_skipped_rules(pyyaml_data, lintable)
     except RuntimeError:
         # Notify user of skip error, do not stop, do not change exit code
-        _logger.error("Error trying to append skipped rules", exc_info=True)
+        _logger.exception("Error trying to append skipped rules")
         return pyyaml_data
 
     if not yaml_skip:
@@ -78,7 +124,7 @@ def append_skipped_rules(
     return yaml_skip
 
 
-@lru_cache(maxsize=128)
+@cache
 def load_data(file_text: str) -> Any:
     """Parse ``file_text`` as yaml and return parsed structure.
 
@@ -88,32 +134,68 @@ def load_data(file_text: str) -> Any:
     :return: Parsed yaml
     """
     yaml = YAML()
-    return yaml.load(file_text)
+    # Ruamel role is not to validate the yaml file, so we ignore duplicate keys:
+    yaml.allow_duplicate_keys = True
+    try:
+        return yaml.load(file_text)
+    except ComposerError:
+        # load fails on multi-documents with ComposerError exception
+        return yaml.load_all(file_text)
 
 
-def _append_skipped_rules(
-    pyyaml_data: "AnsibleBaseYAMLObject", lintable: Lintable
-) -> Optional["AnsibleBaseYAMLObject"]:
+def _append_skipped_rules(  # type: ignore[no-any-unimported]
+    pyyaml_data: AnsibleBaseYAMLObject,
+    lintable: Lintable,
+) -> AnsibleBaseYAMLObject | None:
     # parse file text using 2nd parser library
-    ruamel_data = load_data(lintable.content)
+    try:
+        ruamel_data = load_data(lintable.content)
+    except ScannerError as exc:
+        _logger.debug(
+            "Ignored loading skipped rules from file %s due to: %s",
+            lintable,
+            exc,
+        )
+        # For unparsable file types, we return empty skip lists
+        return None
+    skipped_rules = _get_rule_skips_from_yaml(ruamel_data, lintable)
 
-    if lintable.kind in ["yaml", "requirements", "vars", "meta", "reno"]:
-        pyyaml_data[0]["skipped_rules"] = _get_rule_skips_from_yaml(ruamel_data)
+    if lintable.kind in [
+        "yaml",
+        "requirements",
+        "vars",
+        "meta",
+        "reno",
+        "test-meta",
+        "galaxy",
+    ]:
+        # AnsibleMapping, dict
+        if isinstance(pyyaml_data, MutableMapping):
+            pyyaml_data[SKIPPED_RULES_KEY] = skipped_rules
+        # AnsibleSequence, list
+        elif (
+            not isinstance(pyyaml_data, str)
+            and isinstance(pyyaml_data, collections.abc.Sequence)
+            and skipped_rules
+        ):
+            pyyaml_data[0][SKIPPED_RULES_KEY] = skipped_rules
+
         return pyyaml_data
 
     # create list of blocks of tasks or nested tasks
-    if lintable.kind in ("tasks", "handlers"):
-        ruamel_task_blocks = ruamel_data
-        pyyaml_task_blocks = pyyaml_data
-    elif lintable.kind == "playbook":
-        try:
-            pyyaml_task_blocks = _get_task_blocks_from_playbook(pyyaml_data)
-            ruamel_task_blocks = _get_task_blocks_from_playbook(ruamel_data)
-        except (AttributeError, TypeError):
-            # TODO(awcrosby): running ansible-lint on any .yml file will
-            # assume it is a playbook, check needs to be added higher in the
-            # call stack, and can remove this except
+    pyyaml_task_blocks: Sequence[Any]
+    if lintable.kind in ("tasks", "handlers", "playbook"):
+        if not isinstance(pyyaml_data, Sequence):
             return pyyaml_data
+        if lintable.kind in ("tasks", "handlers"):
+            ruamel_task_blocks = ruamel_data
+            pyyaml_task_blocks = pyyaml_data
+        else:
+            try:
+                pyyaml_task_blocks = _get_task_blocks_from_playbook(pyyaml_data)
+                ruamel_task_blocks = _get_task_blocks_from_playbook(ruamel_data)
+            except (AttributeError, TypeError):
+                return pyyaml_data
     else:
         # For unsupported file types, we return empty skip lists
         return None
@@ -123,32 +205,32 @@ def _append_skipped_rules(
     ruamel_tasks = _get_tasks_from_blocks(ruamel_task_blocks)
 
     # append skipped_rules for each task
-    for ruamel_task, pyyaml_task in zip(ruamel_tasks, pyyaml_tasks):
-
+    for ruamel_task, pyyaml_task in zip(ruamel_tasks, pyyaml_tasks, strict=False):
         # ignore empty tasks
         if not pyyaml_task and not ruamel_task:
             continue
 
+        # AnsibleUnicode or str
+        if isinstance(pyyaml_task, str):
+            continue
+
         if pyyaml_task.get("name") != ruamel_task.get("name"):
-            raise RuntimeError("Error in matching skip comment to a task")
-        pyyaml_task["skipped_rules"] = _get_rule_skips_from_yaml(ruamel_task)
+            msg = "Error in matching skip comment to a task"
+            raise RuntimeError(msg)
+        pyyaml_task[SKIPPED_RULES_KEY] = _get_rule_skips_from_yaml(
+            ruamel_task,
+            lintable,
+        )
 
     return pyyaml_data
 
 
-def _get_task_blocks_from_playbook(playbook: Sequence[Any]) -> List[Any]:
+def _get_task_blocks_from_playbook(playbook: Sequence[Any]) -> list[Any]:
     """Return parts of playbook that contains tasks, and nested tasks.
 
     :param playbook: playbook yaml from yaml parser.
     :returns: list of task dictionaries.
     """
-    PLAYBOOK_TASK_KEYWORDS = [
-        "tasks",
-        "pre_tasks",
-        "post_tasks",
-        "handlers",
-    ]
-
     task_blocks = []
     for play, key in product(playbook, PLAYBOOK_TASK_KEYWORDS):
         task_blocks.extend(play.get(key, []))
@@ -157,47 +239,66 @@ def _get_task_blocks_from_playbook(playbook: Sequence[Any]) -> List[Any]:
 
 def _get_tasks_from_blocks(task_blocks: Sequence[Any]) -> Generator[Any, None, None]:
     """Get list of tasks from list made of tasks and nested tasks."""
-    NESTED_TASK_KEYS = [
-        "block",
-        "always",
-        "rescue",
-    ]
+    if not task_blocks:
+        return
 
     def get_nested_tasks(task: Any) -> Generator[Any, None, None]:
+        if not task or not is_nested_task(task):
+            return
         for k in NESTED_TASK_KEYS:
-            if task and k in task and task[k]:
+            if task.get(k):
+                if hasattr(task[k], "get"):
+                    continue
                 for subtask in task[k]:
+                    yield from get_nested_tasks(subtask)
                     yield subtask
 
     for task in task_blocks:
-        for sub_task in get_nested_tasks(task):
-            yield sub_task
+        yield from get_nested_tasks(task)
         yield task
 
 
-def _get_rule_skips_from_yaml(yaml_input: Sequence[Any]) -> Sequence[Any]:
+def _get_rule_skips_from_yaml(
+    yaml_input: Sequence[Any],
+    lintable: Lintable,
+) -> Sequence[Any]:
     """Traverse yaml for comments with rule skips and return list of rules."""
-    yaml_comment_obj_strs = []
+    yaml_comment_obj_strings = []
+
+    if isinstance(yaml_input, str):
+        return []
 
     def traverse_yaml(obj: Any) -> None:
-        yaml_comment_obj_strs.append(str(obj.ca.items))
+        for entry in obj.ca.items.values():
+            for v in entry:
+                if isinstance(v, CommentToken):
+                    comment_str = v.value
+                    if _noqa_comment_re.match(comment_str):
+                        line = v.start_mark.line + 1  # ruamel line numbers start at 0
+                        lintable.line_skips[line].update(
+                            get_rule_skips_from_line(
+                                comment_str.strip(),
+                                lintable=lintable,
+                                lineno=line,
+                            ),
+                        )
+        yaml_comment_obj_strings.append(str(obj.ca.items))
         if isinstance(obj, dict):
-            for key, val in obj.items():
-                if isinstance(val, (dict, list)):
+            for val in obj.values():
+                if isinstance(val, dict | list):
                     traverse_yaml(val)
         elif isinstance(obj, list):
-            for e in obj:
-                if isinstance(e, (dict, list)):
-                    traverse_yaml(e)
-        else:
-            return
+            for element in obj:
+                if isinstance(element, dict | list):
+                    traverse_yaml(element)
 
-    traverse_yaml(yaml_input)
+    if isinstance(yaml_input, dict | list):
+        traverse_yaml(yaml_input)
 
     rule_id_list = []
-    for comment_obj_str in yaml_comment_obj_strs:
+    for comment_obj_str in yaml_comment_obj_strings:
         for line in comment_obj_str.split(r"\n"):
-            rule_id_list.extend(get_rule_skips_from_line(line))
+            rule_id_list.extend(get_rule_skips_from_line(line, lintable=lintable))
 
     return [normalize_tag(tag) for tag in rule_id_list]
 
@@ -208,3 +309,12 @@ def normalize_tag(tag: str) -> str:
         used_old_tags[tag] = RENAMED_TAGS[tag]
         return RENAMED_TAGS[tag]
     return tag
+
+
+def is_nested_task(task: dict[str, Any]) -> bool:
+    """Check if task includes block/always/rescue."""
+    # Cannot really trust the input
+    if isinstance(task, str):
+        return False
+
+    return any(task.get(key) for key in NESTED_TASK_KEYS)

@@ -1,8 +1,10 @@
 """Utils related to logging."""
+
 import logging
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -15,4 +17,4 @@ def timed_info(msg: Any, *args: Any) -> Iterator[None]:
         yield
     finally:
         elapsed = time.time() - start
-        _logger.info(msg + " (%.2fs)", *(*args, elapsed))
+        _logger.info(msg + " (%.2fs)", *(*args, elapsed))  # noqa: G003

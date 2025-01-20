@@ -1,4 +1,5 @@
 ---
-
-- block:
-    - include_tasks: simpletask.yml
+- name: include-in-block-inner | I am a block
+  block:
+    - name: simple_task | Include tasks from inside a block
+      ansible.builtin.include_tasks: simple_task.yml

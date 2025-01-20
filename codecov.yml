@@ -1,8 +1,8 @@
-codecov:
-  require_ci_to_pass: true
+---
 comment: false
 coverage:
   status:
-    patch: false
+    patch: true
     project:
-      threshold: 0.5%
+      default:
+        threshold: 0.5%
